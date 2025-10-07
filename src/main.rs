@@ -1,91 +1,16 @@
 use clap::Parser;
-use hex::{decode, encode};
 use rand::prelude::*;
 use rand_chacha::ChaCha20Rng;
-use serde::de::Error;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::BufReader;
 use std::time::Instant;
 
-pub type Address = [u8; 20];
-pub type Slot = [u8; 32];
-pub type FlatKey = u64;
-pub type FlatValue = u64;
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Key {
-    pub address: Address,
-    pub slot: Slot,
-}
-
-impl Serialize for Key {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Key", 2)?;
-        s.serialize_field("address", &format!("0x{}", encode(self.address)))?;
-        s.serialize_field("slot", &format!("0x{}", encode(self.slot)))?;
-        s.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for Key {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct KeyHelper {
-            address: String,
-            slot: String,
-        }
-
-        let helper = KeyHelper::deserialize(deserializer)?;
-
-        // strip "0x"
-        let addr_bytes =
-            decode(helper.address.trim_start_matches("0x")).map_err(D::Error::custom)?;
-        let slot_bytes = decode(helper.slot.trim_start_matches("0x")).map_err(D::Error::custom)?;
-
-        if addr_bytes.len() != 20 {
-            return Err(D::Error::custom("address must be 20 bytes"));
-        }
-        if slot_bytes.len() != 32 {
-            return Err(D::Error::custom("slot must be 32 bytes"));
-        }
-
-        let mut address = [0u8; 20];
-        address.copy_from_slice(&addr_bytes);
-
-        let mut slot = [0u8; 32];
-        slot.copy_from_slice(&slot_bytes);
-
-        Ok(Key { address, slot })
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Tx {
-    pub id: u64,
-    pub reads: Vec<Key>,
-    pub writes: Vec<Key>,
-    pub gas_hint: u64,
-    pub metadata: Option<String>,
-    pub program: Vec<MicroOp>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum MicroOp {
-    SLOAD { key: Key },
-    SSTORE { key: Key },
-    ADD { imm: FlatValue },
-    NOOP,
-}
+mod db;
+mod types;
+use db::*;
+use types::*;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -116,13 +41,6 @@ struct Args {
 
     #[arg(long, default_value_t = 42)]
     seed: u64,
-}
-
-#[derive(Debug)]
-pub struct TxExecResult {
-    pub id: u64,
-    pub reads: HashSet<FlatKey>,
-    pub writes: HashSet<FlatKey>,
 }
 
 fn random_address<R: Rng>(rng: &mut R) -> Address {
@@ -229,9 +147,9 @@ fn generate_block(args: &Args) -> Vec<Tx> {
     txs
 }
 
-fn exec_tx(tx: &Tx, state: &mut HashMap<FlatKey, FlatValue>) -> TxExecResult {
-    let mut reads = HashSet::new();
-    let mut writes = HashSet::new();
+fn exec_tx(tx: &Tx, state: &mut impl StateDB) -> TxRWSet {
+    let mut reads = BTreeSet::new();
+    let mut writes = BTreeSet::new();
     let mut acc = 0;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
@@ -241,7 +159,7 @@ fn exec_tx(tx: &Tx, state: &mut HashMap<FlatKey, FlatValue>) -> TxExecResult {
                 key.hash(&mut hasher);
                 let h = hasher.finish();
 
-                let v = state.get(&h).cloned().unwrap_or_else(|| 0);
+                let v = state.get_state(&h).unwrap();
                 acc += v;
                 reads.insert(h);
             }
@@ -249,7 +167,7 @@ fn exec_tx(tx: &Tx, state: &mut HashMap<FlatKey, FlatValue>) -> TxExecResult {
                 key.hash(&mut hasher);
                 let h = hasher.finish();
 
-                state.insert(h, acc);
+                state.set_state(h, acc);
                 writes.insert(h);
             }
             MicroOp::ADD { imm } => {
@@ -259,16 +177,16 @@ fn exec_tx(tx: &Tx, state: &mut HashMap<FlatKey, FlatValue>) -> TxExecResult {
         }
     }
 
-    TxExecResult {
+    TxRWSet {
         id: tx.id,
         reads,
         writes,
     }
 }
 
-fn serial_execute(txs: &[Tx]) -> (HashMap<FlatKey, FlatValue>, Vec<TxExecResult>) {
-    let mut state: HashMap<FlatKey, FlatValue> = HashMap::new();
-    let mut results: Vec<TxExecResult> = Vec::new();
+fn serial_execute(txs: &[Tx]) -> (MapState, Vec<TxRWSet>) {
+    let mut state = MapState::new();
+    let mut results: Vec<TxRWSet> = Vec::new();
 
     for tx in txs.iter() {
         let res = exec_tx(tx, &mut state);
