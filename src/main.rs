@@ -50,12 +50,6 @@ fn random_address<R: Rng>(rng: &mut R) -> Address {
     a
 }
 
-fn random_slot<R: Rng>(rng: &mut R) -> Slot {
-    let mut s = [0u8; 32];
-    rng.fill_bytes(&mut s);
-    s
-}
-
 fn key_from_idx(idx: usize, addr_pool: &[Address]) -> Key {
     let mut slot = [0u8; 32];
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
